@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Show GPU usage and the usernames using each SSH host's physical NVIDIA GPUs."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+
+# Resolve owners on the host so PIDs never need to leave the machine.
+REMOTE = r"""
+from functools import lru_cache
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+def metric(value, unit):
+    match = re.fullmatch(r"([0-9]+)\s*" + unit, (value or "").strip())
+    return int(match[1]) if match else None
+
+@lru_cache(maxsize=None)
+def process_owner(pid):
+    if not re.fullmatch(r"[0-9]+", pid or ""):
+        return None
+    try:
+        with open("/proc/{}/status".format(pid), "rb") as status:
+            for line in status:
+                if line.startswith(b"Uid:"):
+                    effective_uid = int(line.split()[2])
+                    return pwd.getpwuid(effective_uid).pw_name
+    except (OSError, KeyError, ValueError, IndexError, OverflowError):
+        pass
+    return None
+
+try:
+    xml = subprocess.check_output(
+        ["nvidia-smi", "-q", "-x"], stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), timeout=10,
+    )
+    root = ET.fromstring(xml)
+    gpus = root.findall("gpu")
+    if root.tag != "nvidia_smi_log" or not gpus or int(root.findtext("attached_gpus", "-1")) != len(gpus):
+        sys.exit(71)
+    cards = []
+    for index, gpu in enumerate(gpus):
+        activity = metric(gpu.findtext("utilization/gpu_util"), "%")
+        if activity is not None and activity > 100:
+            activity = None
+        memory = metric(gpu.findtext("fb_memory_usage/used"), "MiB")
+        processes = gpu.find("processes")
+        jobs = gpu.findall("processes/process_info")
+        empty = processes is not None and len(processes) == 0 and not (processes.text or "").strip()
+        mig = (gpu.findtext("mig_mode/current_mig") or "").strip()
+        owners = set()
+        if jobs or (activity is not None and activity > 0):
+            state = "busy"
+            owners = {process_owner(job.findtext("pid")) for job in jobs}
+            owners = owners or {None}
+        elif activity == 0 and memory is not None and memory <= 16 and empty and mig in ("Disabled", "N/A", "[N/A]"):
+            state = "idle"
+        else:
+            state = "unknown"
+        cards.append(dict(index=index, utilization=activity, state=state,
+                          owners=sorted(owners, key=lambda name: (name is None, name or ""))))
+    print(json.dumps(cards))
+except (OSError, ValueError, ET.ParseError, subprocess.SubprocessError):
+    sys.exit(71)
+"""
+
+HOSTS_FILE = Path("~/.config/gpu-watch/hosts").expanduser()
+
+SSH_FLAGS = [
+    "-n", "-T", "-a", "-x", "-S", "none",
+    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+    "-o", "ClearAllForwardings=yes", "-o", "AddKeysToAgent=no",
+    "-o", "UpdateHostKeys=no", "-o", "PermitLocalCommand=no",
+    "-o", "ConnectTimeout=6", "-o", "ConnectionAttempts=1",
+]
+MAX_REPLY = 65536
+DEADLINE = 18
+
+
+def parse_cards(output):
+    try:
+        cards = json.loads(output)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid GPU usage response") from None
+    if not isinstance(cards, list) or not cards:
+        raise ValueError("invalid GPU usage response")
+    for index, card in enumerate(cards):
+        if (not isinstance(card, dict) or type(card.get("index")) is not int
+                or card["index"] != index or card.get("state") not in ("idle", "busy", "unknown")):
+            raise ValueError("invalid GPU card")
+        use = card.get("utilization")
+        if use is not None and (type(use) is not int or not 0 <= use <= 100):
+            raise ValueError("invalid GPU utilization")
+        owners = card.get("owners")
+        if not isinstance(owners, list):
+            raise ValueError("invalid GPU owners")
+        for name in owners:
+            if name is not None and (not isinstance(name, str) or not name):
+                raise ValueError("invalid GPU username")
+        card["owners"] = [name if name is None or name.isprintable() else ascii(name) for name in owners]
+    return cards
+
+
+def summarize(cards):
+    by_user = {}
+    for card in cards:
+        for name in card["owners"]:
+            by_user.setdefault(name, set()).add(card["index"])
+    groups = []
+    for name in sorted(by_user, key=lambda name: (name is None, name or "")):
+        label = name or "unknown"
+        indices = ", ".join(map(str, sorted(by_user[name])))
+        groups.append(f"{label} (GPU {indices})")
+    idle = sum(card["state"] == "idle" for card in cards)
+    unknown = sum(card["state"] == "unknown" for card in cards)
+    return len(cards) - idle - unknown, idle, unknown, " | ".join(groups) or "—"
+
+
+def ssh_usage(host):
+    # Use a fixed remote command and pass the destination as an argv element.
+    cmd = ["ssh", *SSH_FLAGS, "--", host, "python3 -IB -c " + shlex.quote(REMOTE)]
+    deadline = time.monotonic() + DEADLINE
+    with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True) as child:
+        output, errors = bytearray(), bytearray()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ, output)
+                selector.register(child.stderr, selectors.EVENT_READ, errors)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    for key, _ in selector.select(remaining):
+                        chunk = os.read(key.fd, MAX_REPLY + 1)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        if len(output) + len(errors) + len(chunk) > MAX_REPLY:
+                            raise ValueError("SSH response exceeded the size limit")
+                        key.data.extend(chunk)
+            code = child.wait(timeout=max(0, deadline - time.monotonic()))
+        finally:
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if code:
+            if b"permission denied" in errors.lower() or b"signing failed" in errors.lower():
+                raise ValueError("SSH authentication failed; unlock your key in Terminal")
+            if b"host key verification failed" in errors.lower() or b"identification has changed" in errors.lower():
+                raise ValueError("SSH host key verification failed")
+            if code == 71:
+                raise ValueError("GPU inventory unavailable")
+            if code == 127:
+                raise ValueError("remote python3 unavailable")
+            raise ValueError(f"SSH or remote command failed (exit {code})")
+        return parse_cards(output)
+
+
+def query(host):
+    try:
+        return ssh_usage(host), ""
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return None, "timed out"
+    except (ValueError, OSError) as exc:
+        return None, str(exc)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="check_gpu_util", description=__doc__, epilog=(
+        "Idle requires 0% utilization, at most 16 MiB in use, and an empty process list. "
+        "Uncertain readings are counted as unknown. USERS groups busy GPU indices by process owner. "
+        "An unknown owner means a busy GPU had no visible username. "
+        "SSH uses your existing login credentials in batch mode."
+    ))
+    parser.add_argument(
+        "hosts", nargs="*", metavar="SSH_HOST",
+        help="SSH aliases or hostnames (default: read ~/.config/gpu-watch/hosts)",
+    )
+    parser.add_argument("--json", action="store_true", help="return per-card readings as JSON")
+    args = parser.parse_args()
+    hosts = args.hosts
+    if not hosts:
+        try:
+            lines = HOSTS_FILE.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"Couldn't read ~/.config/gpu-watch/hosts: {exc}")
+        entries = (line.split("#", 1)[0].strip() for line in lines)
+        hosts = [entry for entry in entries if entry]
+        if not hosts:
+            parser.error("Add one SSH host per line to ~/.config/gpu-watch/hosts.")
+    hosts = list(dict.fromkeys(hosts))
+    if not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:@%-]*", h) for h in hosts):
+        parser.error("invalid destination; use an SSH config alias or hostname")
+    with ThreadPoolExecutor(max_workers=min(16, len(hosts))) as pool:
+        readings = [
+            dict(host=host, cards=cards or [], error=error or None)
+            for host, (cards, error) in zip(hosts, pool.map(query, hosts))
+        ]
+    if args.json:
+        print(json.dumps(readings))
+    else:
+        width = max(len("MACHINE"), max(map(len, hosts)))
+        print(f"{'MACHINE':<{width}}  {'IN USE':>6}  {'IDLE':>4}  {'UNKNOWN':>7}  USERS")
+        for reading in readings:
+            host, cards, error = reading["host"], reading["cards"], reading["error"]
+            if error:
+                print(f"{host:<{width}}  {'-':>6}  {'-':>4}  {'-':>7}  {error}")
+            else:
+                used, idle, unknown, users = summarize(cards)
+                print(f"{host:<{width}}  {used:>6}  {idle:>4}  {unknown:>7}  {users}")
+    return int(any(reading["error"] for reading in readings))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
