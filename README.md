@@ -1,10 +1,12 @@
 # GPU Watch
 
-GPU Watch is a native macOS menu bar app for finding idle NVIDIA GPUs on machines you can reach over SSH. The chip shows the total idle count. Click it for a dashboard with numerically sorted hosts, per-card utilization, and process owners. Mint cards are idle. Hover over or click a card to see all reported owners.
+GPU Watch is a native macOS menu bar app for finding idle NVIDIA GPUs on machines you can reach over SSH. The chip shows how many GPUs are free. Click it to see one row per machine and one column per GPU.
+
+Green checkmarks mark free cards. Blue highlights show GPUs used by your SSH login on each machine, including GPUs you share. The outer ring shows GPU load and the inner ring shows VRAM usage. Hover over a dial for exact readings and owners, or click to pin its details. Click a machine name to see the GPU numbers assigned to each user and the numbers of the free cards.
 
 ## Quick start
 
-1. Download and unzip **GPU Watch** from [Releases](https://github.com/kaonlabs/gpu-watch/releases/latest), or build it locally using the instructions below.
+1. Download and unzip **GPU Watch** from [Releases](https://github.com/kaonlabs/gpu-watch/releases/latest). The same app runs on Apple silicon and Intel Macs.
 2. Create the directory `~/.config/gpu-watch` if needed. Open or create `~/.config/gpu-watch/hosts` in a text editor and add one SSH alias or hostname per line. Blank lines and comments starting with `#` are allowed. Replace these example names with hosts from your own SSH config.
 
    ```text

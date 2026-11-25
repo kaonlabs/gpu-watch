@@ -59,6 +59,7 @@ try:
         if activity is not None and activity > 100:
             activity = None
         memory = metric(gpu.findtext("fb_memory_usage/used"), "MiB")
+        memory_total = metric(gpu.findtext("fb_memory_usage/total"), "MiB")
         processes = gpu.find("processes")
         jobs = gpu.findall("processes/process_info")
         empty = processes is not None and len(processes) == 0 and not (processes.text or "").strip()
@@ -72,9 +73,14 @@ try:
             state = "idle"
         else:
             state = "unknown"
-        cards.append(dict(index=index, utilization=activity, state=state,
+        cards.append(dict(index=index, utilization=activity,
+                          vramUsedMiB=memory, vramTotalMiB=memory_total, state=state,
                           owners=sorted(owners, key=lambda name: (name is None, name or ""))))
-    print(json.dumps(cards))
+    try:
+        login_user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        login_user = None
+    print(json.dumps(dict(cards=cards, loginUser=login_user)))
 except (OSError, ValueError, ET.ParseError, subprocess.SubprocessError):
     sys.exit(71)
 """
@@ -92,11 +98,17 @@ MAX_REPLY = 65536
 DEADLINE = 18
 
 
-def parse_cards(output):
+def parse_reading(output):
     try:
-        cards = json.loads(output)
+        reading = json.loads(output)
     except (ValueError, RecursionError):
         raise ValueError("invalid GPU usage response") from None
+    if not isinstance(reading, dict):
+        raise ValueError("invalid GPU usage response")
+    login_user = reading.get("loginUser")
+    if login_user is not None and (not isinstance(login_user, str) or not login_user.isprintable()):
+        login_user = None
+    cards = reading.get("cards")
     if not isinstance(cards, list) or not cards:
         raise ValueError("invalid GPU usage response")
     for index, card in enumerate(cards):
@@ -106,6 +118,10 @@ def parse_cards(output):
         use = card.get("utilization")
         if use is not None and (type(use) is not int or not 0 <= use <= 100):
             raise ValueError("invalid GPU utilization")
+        for field in ("vramUsedMiB", "vramTotalMiB"):
+            size = card.get(field)
+            if type(size) is not int or not 0 <= size < 2**31:
+                card[field] = None
         owners = card.get("owners")
         if not isinstance(owners, list):
             raise ValueError("invalid GPU owners")
@@ -113,7 +129,7 @@ def parse_cards(output):
             if name is not None and (not isinstance(name, str) or not name):
                 raise ValueError("invalid GPU username")
         card["owners"] = [name if name is None or name.isprintable() else ascii(name) for name in owners]
-    return cards
+    return dict(cards=cards, loginUser=login_user)
 
 
 def summarize(cards):
@@ -171,16 +187,17 @@ def ssh_usage(host):
             if code == 127:
                 raise ValueError("remote python3 unavailable")
             raise ValueError(f"SSH or remote command failed (exit {code})")
-        return parse_cards(output)
+        return parse_reading(output)
 
 
 def query(host):
     try:
-        return ssh_usage(host), ""
+        return dict(host=host, error=None, **ssh_usage(host))
     except (TimeoutError, subprocess.TimeoutExpired):
-        return None, "timed out"
+        error = "timed out"
     except (ValueError, OSError) as exc:
-        return None, str(exc)
+        error = str(exc)
+    return dict(host=host, cards=[], loginUser=None, error=error)
 
 
 def main():
@@ -212,10 +229,7 @@ def main():
     if not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:@%-]*", h) for h in hosts):
         parser.error("invalid destination; use an SSH config alias or hostname")
     with ThreadPoolExecutor(max_workers=min(16, len(hosts))) as pool:
-        readings = [
-            dict(host=host, cards=cards or [], error=error or None)
-            for host, (cards, error) in zip(hosts, pool.map(query, hosts))
-        ]
+        readings = list(pool.map(query, hosts))
     if args.json:
         print(json.dumps(readings))
     else:

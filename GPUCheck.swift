@@ -5,30 +5,82 @@ enum GPUState: String, CaseIterable, Decodable, Sendable {
     case idle, busy, unknown
 }
 
+enum GPUOccupant: Hashable {
+    case free, user(String), unknownUser, unknownState
+
+    var label: String {
+        switch self {
+        case .free: "Free"
+        case .user(let name): name
+        case .unknownUser: "Owner unknown"
+        case .unknownState: "Availability unknown"
+        }
+    }
+}
+
+struct GPUAssignment: Identifiable {
+    let occupant: GPUOccupant
+    let indices: [Int]
+    var id: GPUOccupant { occupant }
+
+    var gpuNumbers: String {
+        var ranges: [ClosedRange<Int>] = []
+        for index in indices.sorted() {
+            if let last = ranges.last, last.upperBound < index, last.upperBound + 1 == index {
+                ranges[ranges.count - 1] = last.lowerBound...index
+            } else {
+                ranges.append(index...index)
+            }
+        }
+        return ranges.map { $0.lowerBound == $0.upperBound ? "\($0.lowerBound)" : "\($0.lowerBound)–\($0.upperBound)" }
+            .joined(separator: ", ")
+    }
+}
+
 struct GPUCard: Decodable, Identifiable, Sendable {
     let index: Int
     let utilization: Int?
+    let vramUsedMiB: Int?
+    let vramTotalMiB: Int?
     let state: GPUState
     let owners: [String?]
 
     var id: Int { index }
     var percent: String { utilization.map { "\($0)%" } ?? "–" }
+    var vramFraction: Double? {
+        guard let vramUsedMiB, let vramTotalMiB, vramTotalMiB > 0,
+              (0...vramTotalMiB).contains(vramUsedMiB) else { return nil }
+        return Double(vramUsedMiB) / Double(vramTotalMiB)
+    }
 
-    var ownerBadge: String {
+    var vramPercent: String { vramFraction.map { "\(Int(($0 * 100).rounded()))%" } ?? "–" }
+
+    var vramDescription: String {
+        guard vramFraction != nil, let vramUsedMiB, let vramTotalMiB else { return "VRAM unavailable" }
+        return "VRAM \(vramUsedMiB.formatted()) / \(vramTotalMiB.formatted()) MiB (\(vramPercent))"
+    }
+
+    var occupants: [GPUOccupant] {
         switch state {
-        case .idle: "Idle"
-        case .unknown: "Unknown"
-        case .busy: owners.compactMap { $0 }.first ?? "Unknown"
+        case .idle: return [.free]
+        case .unknown: return [.unknownState]
+        case .busy:
+            let users = Set(owners.compactMap { $0 }).sorted().map(GPUOccupant.user)
+            return users.isEmpty || owners.contains(nil) ? users + [.unknownUser] : users
         }
     }
 
+    var ownerLine: String { occupants.map(\.label).joined(separator: ", ") }
+
+    func isOwned(by loginUser: String?) -> Bool {
+        guard state == .busy, let loginUser else { return false }
+        return owners.contains(loginUser)
+    }
+
     var ownerDescription: String {
-        switch state {
-        case .idle: "Idle"
-        case .unknown: "Availability unknown"
-        case .busy where owners.compactMap({ $0 }).isEmpty: "In use by an unknown user"
-        case .busy: "In use by " + owners.map { $0 ?? "unknown user" }.joined(separator: ", ")
-        }
+        guard state == .busy else { return ownerLine }
+        let names = occupants.map { $0 == .unknownUser ? "unknown user" : $0.label }
+        return "In use by " + names.joined(separator: ", ")
     }
 }
 
@@ -36,9 +88,27 @@ struct GPUHost: Decodable, Identifiable, Sendable {
     let host: String
     let cards: [GPUCard]
     let error: String?
+    let loginUser: String?
 
     var id: String { host }
     var isReachable: Bool { error == nil && !cards.isEmpty }
+
+    var assignments: [GPUAssignment] {
+        var indices: [GPUOccupant: [Int]] = [:]
+        for card in cards {
+            for occupant in card.occupants {
+                indices[occupant, default: []].append(card.index)
+            }
+        }
+        let users = indices.keys.compactMap { occupant -> String? in
+            guard case .user(let name) = occupant else { return nil }
+            return name
+        }.sorted()
+        let order: [GPUOccupant] = [.free] + users.map(GPUOccupant.user) + [.unknownUser, .unknownState]
+        return order.compactMap { occupant in
+            indices[occupant].map { GPUAssignment(occupant: occupant, indices: $0) }
+        }
+    }
 
     subscript(_ state: GPUState) -> Int { cards.filter { $0.state == state }.count }
 }
